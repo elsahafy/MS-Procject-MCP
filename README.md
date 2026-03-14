@@ -215,3 +215,11 @@ All tests require MS Project to be running (they create and close temporary proj
 ## Architecture
 
 Single-file server (`server.py`, ~3,900 lines) using the FastMCP framework. All COM calls go through `get_app()` / `get_proj()` helpers. Dates are normalized with `_to_naive()` and formatted with `_fmt_date()`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, conventions, and how to submit changes.
+
+## License
+
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
