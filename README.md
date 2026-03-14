@@ -33,7 +33,7 @@ Control Microsoft Project via COM automation through the Model Context Protocol 
 python server.py
 ```
 
-## Tool Inventory (96 tools)
+## Tool Inventory (99 tools)
 
 ### Project Management (7)
 
@@ -151,7 +151,7 @@ python server.py
 |------|-------------|
 | `set_working_hours` | Modify working hours for a specific day of the week |
 
-### Scheduling & Analysis (9)
+### Scheduling & Analysis (12)
 
 | Tool | Description |
 |------|-------------|
@@ -164,6 +164,9 @@ python server.py
 | `get_constraints` | Read non-default constraints on all tasks |
 | `set_task_calendar` | Assign a calendar to a specific task |
 | `set_task_hyperlink` | Set a hyperlink on a task |
+| `get_critical_path_sequence` | Ordered critical path chain from start to finish with driving links |
+| `get_critical_tasks_for_period` | Critical tasks and milestones within a date range (e.g. Q2) |
+| `what_if_delay` | Simulate delaying a task — shows project impact, newly critical tasks, slack loss |
 
 ### Status Date & Progress Updates (2)
 
@@ -276,13 +279,14 @@ python tests/test_phase3.py     # 15 tests (custom fields, calendars, scheduling
 python tests/test_phase4.py     # 23 tests (advanced ops, multi-project, filtering)
 python tests/test_phase5.py     # 11 tests (bug fixes, cost/work tracking)
 python tests/test_phase6.py     # 75 tests (timephased data, calendar mgmt, variance)
+python tests/test_phase7.py     # 57 tests (critical path intelligence, what-if)
 ```
 
-**145 tests total** across 6 test suites. All tests require MS Project to be running (they create and close temporary projects).
+**202 tests total** across 7 test suites. All tests require MS Project to be running (they create and close temporary projects).
 
 ## Architecture
 
-Single-file server (`server.py`, ~4,800 lines) using the FastMCP framework. All COM calls go through `get_app()` / `get_proj()` helpers. Dates are normalized with `_to_naive()` and formatted with `_fmt_date()`.
+Single-file server (`server.py`, ~5,200 lines) using the FastMCP framework. All COM calls go through `get_app()` / `get_proj()` helpers. Dates are normalized with `_to_naive()` and formatted with `_fmt_date()`.
 
 ### Development Phases
 
@@ -293,6 +297,7 @@ Single-file server (`server.py`, ~4,800 lines) using the FastMCP framework. All 
 | 4 | 65 | Advanced operations, multi-project, filtering |
 | 5 | 79 | Bug fixes, cost/work tracking |
 | 6 | 96 | Timephased data, calendar management, resource availability, variance reporting |
+| 7 | 99 | Critical path intelligence: ordered sequence, period filtering, what-if analysis |
 
 ## Contributing
 
