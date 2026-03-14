@@ -65,7 +65,7 @@ async def test():
     try:
         r = await call("set_project_properties", {"properties_json": json.dumps({
             "title": "EXPO 2030 Test Schedule",
-            "manager": "Ibrahim Elsahafy",
+            "manager": "Test Manager",
             "company": "ERC",
             "author": "PMO",
             "subject": "Integration Test",
@@ -75,7 +75,7 @@ async def test():
         # Verify via get_project_info
         info = await call("get_project_info")
         assert info["title"] == "EXPO 2030 Test Schedule", f"title mismatch: {info['title']}"
-        assert info["manager"] == "Ibrahim Elsahafy", f"manager mismatch: {info['manager']}"
+        assert info["manager"] == "Test Manager", f"manager mismatch: {info['manager']}"
         assert info["company"] == "ERC", f"company mismatch: {info['company']}"
         print(f"  Verified: title={info['title']}, manager={info['manager']}, company={info['company']}")
         results["set_project_properties"] = "PASS"
