@@ -3936,7 +3936,7 @@ if __name__ == "__main__":
 #   "mcpServers": {
 #     "msproject": {
 #       "command": "python",
-#       "args": ["C:/Users/Ibrahim Elsahafy/mcp-servers/msproject/server.py"]
+#       "args": ["/path/to/msproject/server.py"]
 #     }
 #   }
 # }

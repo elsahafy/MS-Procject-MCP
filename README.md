@@ -20,7 +20,7 @@ Control Microsoft Project via COM automation through the Model Context Protocol 
   "mcpServers": {
     "msproject": {
       "command": "python",
-      "args": ["C:/Users/Ibrahim Elsahafy/mcp-servers/msproject/server.py"]
+      "args": ["/path/to/msproject/server.py"]
     }
   }
 }
