@@ -270,14 +270,15 @@ Every task query (`get_task`, `get_tasks`, etc.) returns a rich dict with 35+ fi
 
 ```bash
 # Run all phases
-python tests/test_phase2.py   # 10 tests
-python tests/test_phase3.py   # 15 tests
-python tests/test_phase4.py   # 21 tests (+2 skipped)
-python tests/test_phase5.py   # 11 tests (bug fixes + new tools)
-python tests/test_phase6.py   # 72 tests (gap analysis + missing features)
+python tests/test_new_tools.py  # 11 tests (core CRUD)
+python tests/test_phase2.py     # 10 tests (resources, baselines, WBS)
+python tests/test_phase3.py     # 15 tests (custom fields, calendars, scheduling)
+python tests/test_phase4.py     # 23 tests (advanced ops, multi-project, filtering)
+python tests/test_phase5.py     # 11 tests (bug fixes, cost/work tracking)
+python tests/test_phase6.py     # 75 tests (timephased data, calendar mgmt, variance)
 ```
 
-All tests require MS Project to be running (they create and close temporary projects).
+**145 tests total** across 6 test suites. All tests require MS Project to be running (they create and close temporary projects).
 
 ## Architecture
 
