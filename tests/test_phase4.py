@@ -4,6 +4,7 @@ Run: python test_phase4.py
 Requires: MS Project running (will be launched if not)
 """
 import asyncio
+import datetime
 import json
 import os
 import sys
@@ -24,7 +25,10 @@ async def call(tool_name, **kwargs):
     # result is (list_of_TextContent, meta_dict)
     contents = result[0] if isinstance(result, tuple) else result
     text = contents[0].text if contents else ""
-    return json.loads(text) if text else {}
+    try:
+        return json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {"_raw": text}
 
 
 async def run_tests():
@@ -50,6 +54,7 @@ async def run_tests():
     print("\n=== SETUP ===")
 
     r = await call("new_project", title="Phase 4 Test", start="2026-04-01")
+    main_project_name = r.get("name", "Phase 4 Test")
     print(f"  Created project: {r.get('title')}")
 
     # Add tasks: 2 programmes with children + milestones
@@ -165,10 +170,6 @@ async def run_tests():
     copied = r.get("copied_tasks", [])
     ok("9. copy_task_structure", len(copied) > 0, f"copied: {len(copied)} tasks")
 
-    # 10. cross_project_link — requires 2 open projects; COM proxy gets stale
-    #     when creating a 2nd project in-process. Test manually or via MS Project UI.
-    skip("10. cross_project_link", "COM proxy staleness with multi-project in-process; test manually")
-
     # 11. export_csv
     tmp_csv = os.path.join(tempfile.gettempdir(), "phase4_test_export.csv")
     r = await call("export_csv", output_path=tmp_csv)
@@ -214,9 +215,6 @@ async def run_tests():
     ok("17. create_calendar", r.get("status") == "created" and "Test Cal" in r.get("calendars", []),
        f"calendars: {r.get('calendars')}")
 
-    # 18. insert_subproject — skip if no test file
-    skip("18. insert_subproject", "no test .mpp file available")
-
     # 19. apply_filter
     try:
         r = await call("apply_filter", filter_name="Critical")
@@ -239,11 +237,70 @@ async def run_tests():
         os.remove(tmp_json)
 
     # -----------------------------------------------------------------------
+    # Multi-project tests (run last to avoid COM proxy corruption)
+    # -----------------------------------------------------------------------
+
+    # 10. cross_project_link — create a 2nd project via COM, link tasks across them
+    try:
+        import win32com.client
+        app = win32com.client.GetActiveObject("MSProject.Application")
+        app.FileNew()
+        xlink_proj = app.ActiveProject
+        xlink_proj.Title = "Phase 4 Xlink"
+        xt = xlink_proj.Tasks.Add("External Task")
+        xt.Start = datetime.datetime(2026, 7, 1)
+        xt.Duration = 10 * 480
+        xlink_uid = xt.UniqueID
+        xlink_name = xlink_proj.Name
+
+        r = await call("cross_project_link",
+                       source_project=main_project_name,
+                       source_unique_id=uid["Task A"],
+                       target_project=xlink_name,
+                       target_unique_id=xlink_uid)
+        ok("10. cross_project_link", r.get("status") == "linked", str(r))
+
+        app.FileClose(Save=0)
+    except Exception as e:
+        ok("10. cross_project_link", False, str(e))
+
+    # 18. insert_subproject — create fixture .mpp via COM, insert into main
+    try:
+        import win32com.client
+        tmp_mpp = os.path.join(tempfile.gettempdir(), "phase4_subproject_fixture.mpp")
+
+        app = win32com.client.GetActiveObject("MSProject.Application")
+        app.FileNew()
+        sub_proj = app.ActiveProject
+        sub_proj.Title = "Subproject Fixture"
+        st = sub_proj.Tasks.Add("Sub Work")
+        st.Start = datetime.datetime(2026, 8, 1)
+        st.Duration = 5 * 480
+        app.FileSaveAs(Name=tmp_mpp, Format=0, Backup=False, ReadOnly=False)
+        app.FileClose(Save=0)
+
+        # Re-activate main
+        for i in range(1, app.Projects.Count + 1):
+            if main_project_name.lower() in app.Projects(i).Name.lower():
+                app.Projects(i).Activate()
+                break
+
+        r = await call("insert_subproject", file_path=tmp_mpp)
+        ok("18. insert_subproject", r.get("status") == "inserted", str(r))
+
+        try:
+            os.remove(tmp_mpp)
+        except Exception:
+            pass
+    except Exception as e:
+        ok("18. insert_subproject", False, str(e))
+
+    # -----------------------------------------------------------------------
     # Cleanup
     # -----------------------------------------------------------------------
     print("\n=== CLEANUP ===")
     # Close all test projects
-    for proj_name in ["Phase 4 Xlink", "Phase 4 Test"]:
+    for proj_name in ["Phase 4 Test"]:
         try:
             await call("switch_project", name_or_index=proj_name)
             await call("close_project", save=False)

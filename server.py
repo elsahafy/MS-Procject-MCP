@@ -3680,16 +3680,20 @@ def insert_subproject(file_path: str, after_unique_id: int = 0) -> str:
 
     count_before = proj.Tasks.Count
 
-    if after_unique_id > 0:
-        t = _find_task(proj, after_unique_id)
-        if t is None:
-            return json.dumps({"error": f"Task UniqueID {after_unique_id} not found."})
-        app.SelectRow(t.ID + 1, False)
-    else:
-        app.SelectRow(proj.Tasks.Count, False)
-
+    # Insert by adding a task and setting its SubProject property.
+    # (SubprojectInsert is not reliably exposed via COM in all versions.)
     try:
-        app.SubprojectInsert(file_path, ReadOnly=True, LinkToSource=True)
+        import os as _os
+        basename = _os.path.splitext(_os.path.basename(file_path))[0]
+        if after_unique_id > 0:
+            t = _find_task(proj, after_unique_id)
+            if t is None:
+                return json.dumps({"error": f"Task UniqueID {after_unique_id} not found."})
+            app.SelectRow(t.ID + 1, False)
+            new_t = proj.Tasks.Add(basename)
+        else:
+            new_t = proj.Tasks.Add(basename)
+        new_t.SubProject = file_path
     except Exception as e:
         return json.dumps({"error": f"Failed to insert subproject: {e}"})
 
