@@ -204,10 +204,10 @@ python server.py
 
 ```bash
 # Run all phases
-python test_phase2.py   # 10 tests
-python test_phase3.py   # 15 tests
-python test_phase4.py   # 21 tests (+2 skipped)
-python test_phase5.py   #  5 tests (bug fixes + new tools)
+python tests/test_phase2.py   # 10 tests
+python tests/test_phase3.py   # 15 tests
+python tests/test_phase4.py   # 21 tests (+2 skipped)
+python tests/test_phase5.py   # 11 tests (bug fixes + new tools)
 ```
 
 All tests require MS Project to be running (they create and close temporary projects).
