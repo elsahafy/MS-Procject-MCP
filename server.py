@@ -63,29 +63,57 @@ def task_to_dict(t, proj):
         except Exception:
             return None
 
+    # Reverse map for constraint type integers
+    CONSTRAINT_NAMES = {
+        0: "ASAP", 1: "ALAP", 2: "MSO", 3: "MFO",
+        4: "SNET", 5: "SNLT", 6: "FNET", 7: "FNLT",
+    }
+    # Reverse map for task type integers
+    TASK_TYPE_NAMES = {0: "FixedUnits", 1: "FixedDuration", 2: "FixedWork"}
+
+    # Safe reads for fields that may not be available on all task types
+    def safe(prop, default=None):
+        try:
+            return prop
+        except Exception:
+            return default
+
     return {
-        "unique_id":        t.UniqueID,
-        "id":               t.ID,
-        "name":             t.Name,
-        "outline_level":    t.OutlineLevel,
-        "wbs":              t.WBS,
-        "summary":          bool(t.Summary),
-        "milestone":        bool(t.Milestone),
-        "start":            fmt(t.Start),
-        "finish":           fmt(t.Finish),
-        "duration_days":    round(t.Duration / mpd, 2) if t.Duration else 0,
-        "percent_complete": t.PercentComplete,
-        "predecessors":     t.Predecessors,
-        "resource_names":   t.ResourceNames,
-        "notes":            t.Notes,
-        "critical":         bool(t.Critical),
-        "active":           bool(t.Active),
-        "rag":              t.Text1 or "",
-        "text1":            t.Text1 or "",
-        "text2":            t.Text2 or "",
-        "text3":            t.Text3 or "",
-        "flag1":            bool(t.Flag1),
-        "flag2":            bool(t.Flag2),
+        "unique_id":              t.UniqueID,
+        "id":                     t.ID,
+        "name":                   t.Name,
+        "outline_level":          t.OutlineLevel,
+        "wbs":                    t.WBS,
+        "summary":                bool(t.Summary),
+        "milestone":              bool(t.Milestone),
+        "start":                  fmt(t.Start),
+        "finish":                 fmt(t.Finish),
+        "duration_days":          round(t.Duration / mpd, 2) if t.Duration else 0,
+        "percent_complete":       t.PercentComplete,
+        "actual_start":           fmt(safe(t.ActualStart)),
+        "actual_finish":          fmt(safe(t.ActualFinish)),
+        "remaining_duration_days": round(safe(t.RemainingDuration, 0) / mpd, 2),
+        "total_slack_days":       round(safe(t.TotalSlack, 0) / mpd, 2),
+        "free_slack_days":        round(safe(t.FreeSlack, 0) / mpd, 2),
+        "deadline":               fmt(safe(t.Deadline)),
+        "priority":               safe(t.Priority, 500),
+        "constraint_type":        CONSTRAINT_NAMES.get(safe(t.ConstraintType, 0), "ASAP"),
+        "constraint_date":        fmt(safe(t.ConstraintDate)),
+        "manual":                 bool(safe(t.Manual, False)),
+        "type":                   TASK_TYPE_NAMES.get(safe(t.Type, 0), "FixedUnits"),
+        "predecessors":           t.Predecessors,
+        "resource_names":         t.ResourceNames,
+        "notes":                  t.Notes,
+        "critical":               bool(t.Critical),
+        "active":                 bool(t.Active),
+        "rag":                    t.Text1 or "",
+        "text1":                  t.Text1 or "",
+        "text2":                  t.Text2 or "",
+        "text3":                  t.Text3 or "",
+        "flag1":                  bool(t.Flag1),
+        "flag2":                  bool(t.Flag2),
+        "hyperlink":              safe(t.HyperlinkAddress, "") or "",
+        "hyperlink_text":         safe(t.Hyperlink, "") or "",
     }
 
 
@@ -468,6 +496,8 @@ def update_task(
     text3:            str = "",
     flag1:            bool = None,
     flag2:            bool = None,
+    priority:         int = -1,
+    task_type:        str = "",
 ) -> str:
     """
     Update one or more properties of a task identified by UniqueID.
@@ -487,6 +517,8 @@ def update_task(
         text3:            Custom Text3 field.
         flag1:            Custom Flag1 boolean.
         flag2:            Custom Flag2 boolean.
+        priority:         Leveling priority 0-1000 (default 500). 0+ to set.
+        task_type:        'FixedUnits', 'FixedDuration', or 'FixedWork'.
     """
     app  = get_app()
     proj = get_proj(app)
@@ -521,6 +553,13 @@ def update_task(
             t.Flag1 = flag1;            changed.append("flag1")
         if flag2 is not None:
             t.Flag2 = flag2;            changed.append("flag2")
+        if priority >= 0:
+            t.Priority = priority;      changed.append("priority")
+        if task_type:
+            TYPE_MAP = {"fixedunits": 0, "fixedduration": 1, "fixedwork": 2}
+            tt = TYPE_MAP.get(task_type.lower())
+            if tt is not None:
+                t.Type = tt;            changed.append("type")
 
         app.FileSave()
         return json.dumps({
@@ -3917,6 +3956,827 @@ def get_actual_work() -> str:
         "count": len(tasks),
         "tasks": tasks,
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Gap Analysis & Missing Features
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def calculate_project() -> str:
+    """
+    Recalculate the active project schedule.
+    Use after bulk manual changes to ensure dates, slack, and critical path are up to date.
+    """
+    app = get_app()
+    app.CalculateProject()
+    return json.dumps({"status": "calculated", "project": app.ActiveProject.Name})
+
+
+@mcp.tool()
+def list_calendar_exceptions(calendar_name: str = "") -> str:
+    """
+    List all exceptions (holidays, non-working days) defined on a calendar.
+    If calendar_name is empty, uses the project calendar.
+
+    Args:
+        calendar_name: Name of the base calendar. Empty = project calendar.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    if not calendar_name:
+        try:
+            calendar_name = str(proj.Calendar)
+        except Exception:
+            calendar_name = "Standard"
+
+    cal = None
+    for c in proj.BaseCalendars:
+        if c is not None and str(c.Name).lower() == str(calendar_name).lower():
+            cal = c
+            break
+    if cal is None:
+        return json.dumps({"error": f"Calendar '{calendar_name}' not found."})
+
+    exceptions = []
+    try:
+        for exc in cal.Exceptions:
+            exceptions.append({
+                "name":   str(exc.Name),
+                "start":  _fmt_date(exc.Start),
+                "finish": _fmt_date(exc.Finish),
+                "type":   exc.Type,
+            })
+    except Exception:
+        pass  # Some calendars have no Exceptions collection
+
+    return json.dumps({
+        "calendar":   str(cal.Name),
+        "count":      len(exceptions),
+        "exceptions": exceptions,
+    }, indent=2)
+
+
+@mcp.tool()
+def health_check() -> str:
+    """
+    Lightweight connectivity test. Returns MS Project version, whether a project
+    is open, and basic project info if available.
+    """
+    import win32com.client
+    try:
+        app = win32com.client.GetActiveObject("MSProject.Application")
+    except Exception:
+        return json.dumps({"status": "disconnected", "error": "MS Project is not running."})
+
+    result = {
+        "status":  "connected",
+        "version": str(app.Version),
+    }
+
+    if app.Projects.Count > 0:
+        proj = app.ActiveProject
+        result["project_open"] = True
+        result["project_name"] = proj.Name
+        result["task_count"]   = proj.Tasks.Count
+    else:
+        result["project_open"] = False
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_project(complete_through: str, set_0_or_100: bool = False) -> str:
+    """
+    Mark all tasks complete through a given date (the weekly PMO ritual).
+    Tasks that should have finished by the date get their % complete updated.
+
+    Args:
+        complete_through: Date as YYYY-MM-DD — tasks scheduled through this date are updated.
+        set_0_or_100:     If True, tasks are set to 0% or 100% only (no partial). Default False.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+    dt   = _parse_date(complete_through)
+    if dt is None:
+        return json.dumps({"error": "complete_through date is required (YYYY-MM-DD)."})
+
+    # COM VBA signature: UpdateProject(All, UpdateDate, Action)
+    # All = True (entire project), UpdateDate = date, Action:
+    #   pjUpdateProjectStatusPctComplete = 0
+    #   pjUpdateProject0or100 = 1
+    action = 1 if set_0_or_100 else 0
+    try:
+        app.UpdateProject(True, dt, action)
+    except Exception:
+        try:
+            # Alternative: just date
+            app.UpdateProject(True, dt)
+        except Exception:
+            app.UpdateProject(dt)
+    app.FileSave()
+
+    return json.dumps({
+        "status": "updated",
+        "complete_through": complete_through,
+        "set_0_or_100": set_0_or_100,
+        "project": proj.Name,
+    }, indent=2)
+
+
+@mcp.tool()
+def reschedule_incomplete_work(reschedule_from: str = "") -> str:
+    """
+    Move remaining work on incomplete tasks to start after the given date
+    (or the project status date if not specified).
+
+    Args:
+        reschedule_from: Date as YYYY-MM-DD. Empty = use project status date.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    if reschedule_from:
+        dt = _parse_date(reschedule_from)
+    else:
+        dt = proj.StatusDate
+        if dt is None or str(dt) == "NA":
+            dt = datetime.datetime.now()
+
+    # Set status date, then use UpdateProject to reschedule
+    # The reschedule action = updating incomplete tasks from the status date
+    try:
+        proj.StatusDate = dt
+        # UpdateProject with All=True, date, action=0 to push remaining work
+        app.UpdateProject(True, dt, 0)
+    except Exception:
+        try:
+            app.UpdateProject(True, dt)
+        except Exception:
+            proj.StatusDate = dt  # At minimum set the status date
+    app.FileSave()
+
+    return json.dumps({
+        "status": "rescheduled",
+        "reschedule_from": str(dt)[:10],
+        "project": proj.Name,
+    }, indent=2)
+
+
+@mcp.tool()
+def delete_calendar(calendar_name: str) -> str:
+    """
+    Delete a base calendar by name. Cannot delete the project calendar.
+
+    Args:
+        calendar_name: Name of the calendar to delete.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    try:
+        proj_cal = str(proj.Calendar).lower()
+    except Exception:
+        proj_cal = "standard"
+    if proj_cal == calendar_name.lower():
+        return json.dumps({"error": "Cannot delete the active project calendar."})
+
+    for c in proj.BaseCalendars:
+        if c is not None and str(c.Name).lower() == calendar_name.lower():
+            c.Delete()
+            app.FileSave()
+            return json.dumps({"status": "deleted", "calendar": calendar_name})
+
+    return json.dumps({"error": f"Calendar '{calendar_name}' not found."})
+
+
+@mcp.tool()
+def delete_calendar_exception(calendar_name: str, exception_name: str) -> str:
+    """
+    Remove a specific exception (holiday/non-working day) from a calendar.
+
+    Args:
+        calendar_name:  Name of the base calendar.
+        exception_name: Name of the exception to remove.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    cal = None
+    for c in proj.BaseCalendars:
+        if c is not None and str(c.Name).lower() == calendar_name.lower():
+            cal = c
+            break
+    if cal is None:
+        return json.dumps({"error": f"Calendar '{calendar_name}' not found."})
+
+    try:
+        for exc in cal.Exceptions:
+            if str(exc.Name).lower() == exception_name.lower():
+                exc.Delete()
+                app.FileSave()
+                return json.dumps({
+                    "status":    "deleted",
+                    "calendar":  calendar_name,
+                    "exception": exception_name,
+                })
+    except Exception as e:
+        return json.dumps({"error": f"Failed to access exceptions: {e}"})
+
+    return json.dumps({"error": f"Exception '{exception_name}' not found in calendar '{calendar_name}'."})
+
+
+@mcp.tool()
+def set_resource_calendar(resource_name: str, calendar_name: str) -> str:
+    """
+    Assign a specific base calendar to a resource (e.g., part-time, different timezone).
+
+    Args:
+        resource_name: Name of the resource.
+        calendar_name: Name of the base calendar to assign.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    # Verify calendar exists
+    cal_found = False
+    for c in proj.BaseCalendars:
+        if c is not None and str(c.Name).lower() == calendar_name.lower():
+            cal_found = True
+            break
+    if not cal_found:
+        return json.dumps({"error": f"Calendar '{calendar_name}' not found."})
+
+    for r in proj.Resources:
+        if r is not None and r.Name and r.Name.lower() == resource_name.lower():
+            r.BaseCalendar = calendar_name
+            app.FileSave()
+            return json.dumps({
+                "status":   "updated",
+                "resource": r.Name,
+                "calendar": calendar_name,
+            }, indent=2)
+
+    return json.dumps({"error": f"Resource '{resource_name}' not found."})
+
+
+@mcp.tool()
+def get_timephased_data(
+    unique_id:  int,
+    start_date: str,
+    end_date:   str,
+    timescale:  str = "weekly",
+    data_type:  str = "work",
+) -> str:
+    """
+    Get period-by-period timephased data for a task. Essential for S-curves,
+    resource loading charts, and cash flow forecasts.
+
+    Args:
+        unique_id:  Task UniqueID.
+        start_date: Period start as YYYY-MM-DD.
+        end_date:   Period end as YYYY-MM-DD.
+        timescale:  'daily', 'weekly', or 'monthly' (default 'weekly').
+        data_type:  'work', 'cost', 'actual_work', 'actual_cost',
+                    'remaining_work', 'baseline_work', 'baseline_cost' (default 'work').
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    TIMESCALE_MAP = {"daily": 3, "weekly": 4, "monthly": 5}
+    ts = TIMESCALE_MAP.get(timescale.lower())
+    if ts is None:
+        return json.dumps({"error": f"Unknown timescale '{timescale}'. Use: daily, weekly, monthly."})
+
+    # pjTaskTimescaledWork=1, Cost=2, ActualWork=3, ActualCost=4,
+    # RemainingWork=9, BaselineWork=22, BaselineCost=23
+    TYPE_MAP = {
+        "work": 1, "cost": 2, "actual_work": 3, "actual_cost": 4,
+        "remaining_work": 9, "baseline_work": 22, "baseline_cost": 23,
+    }
+    dt = TYPE_MAP.get(data_type.lower())
+    if dt is None:
+        return json.dumps({"error": f"Unknown data_type '{data_type}'. Use: {list(TYPE_MAP.keys())}."})
+
+    t = _find_task(proj, unique_id)
+    if t is None:
+        return json.dumps({"error": f"Task UniqueID {unique_id} not found."})
+
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+    if sd is None or ed is None:
+        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD)."})
+
+    periods = []
+    try:
+        tsd = t.TimeScaleData(sd, ed, dt, ts)
+        for item in tsd:
+            val = item.Value
+            periods.append({
+                "start": _fmt_date(item.StartDate),
+                "end":   _fmt_date(item.EndDate),
+                "value": float(val) if val else 0.0,
+            })
+    except Exception as e:
+        return json.dumps({"error": f"TimeScaleData failed: {e}"})
+
+    return json.dumps({
+        "unique_id": unique_id,
+        "name":      t.Name,
+        "data_type": data_type,
+        "timescale": timescale,
+        "periods":   periods,
+    }, indent=2)
+
+
+@mcp.tool()
+def set_working_hours(calendar_name: str, day: int, shifts_json: str) -> str:
+    """
+    Modify working hours for a specific day of the week in a calendar.
+
+    Args:
+        calendar_name: Name of the base calendar.
+        day:           Day number (1=Sunday, 2=Monday, ..., 7=Saturday).
+        shifts_json:   JSON array of shifts, e.g. [["08:00","12:00"],["13:00","17:00"]].
+                       Empty array [] marks the day as non-working.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    if day < 1 or day > 7:
+        return json.dumps({"error": "day must be 1 (Sunday) through 7 (Saturday)."})
+
+    cal = None
+    for c in proj.BaseCalendars:
+        if c is not None and str(c.Name).lower() == calendar_name.lower():
+            cal = c
+            break
+    if cal is None:
+        return json.dumps({"error": f"Calendar '{calendar_name}' not found."})
+
+    shifts = json.loads(shifts_json)
+
+    wd = cal.WeekDays(day)
+
+    if not shifts:
+        # Mark as non-working
+        wd.Working = False
+        app.FileSave()
+        return json.dumps({
+            "status":   "updated",
+            "calendar": cal.Name,
+            "day":      day,
+            "working":  False,
+        }, indent=2)
+
+    wd.Working = True
+
+    # Set shifts using ShiftN Start/Finish properties (1-indexed)
+    # Clear all 5 shifts first, then set the provided ones
+    shift_attrs = [
+        ("Shift1Start", "Shift1Finish"),
+        ("Shift2Start", "Shift2Finish"),
+        ("Shift3Start", "Shift3Finish"),
+        ("Shift4Start", "Shift4Finish"),
+        ("Shift5Start", "Shift5Finish"),
+    ]
+
+    for i, (s_attr, f_attr) in enumerate(shift_attrs):
+        try:
+            if i < len(shifts):
+                setattr(wd, s_attr, shifts[i][0])
+                setattr(wd, f_attr, shifts[i][1])
+            else:
+                # Clear unused shifts
+                setattr(wd, s_attr, "")
+                setattr(wd, f_attr, "")
+        except Exception:
+            pass
+
+    app.FileSave()
+    return json.dumps({
+        "status":   "updated",
+        "calendar": cal.Name,
+        "day":      day,
+        "working":  True,
+        "shifts":   shifts[:5],
+    }, indent=2)
+
+
+@mcp.tool()
+def get_resource_availability(
+    resource_name: str,
+    start_date:    str,
+    end_date:      str,
+    timescale:     str = "weekly",
+) -> str:
+    """
+    Show resource allocation vs capacity per period. Shows max units, allocated
+    work, and free capacity windows.
+
+    Args:
+        resource_name: Name of the resource.
+        start_date:    Period start as YYYY-MM-DD.
+        end_date:      Period end as YYYY-MM-DD.
+        timescale:     'daily', 'weekly', or 'monthly' (default 'weekly').
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    TIMESCALE_MAP = {"daily": 3, "weekly": 4, "monthly": 5}
+    ts = TIMESCALE_MAP.get(timescale.lower())
+    if ts is None:
+        return json.dumps({"error": f"Unknown timescale '{timescale}'. Use: daily, weekly, monthly."})
+
+    res = None
+    for r in proj.Resources:
+        if r is not None and r.Name and r.Name.lower() == resource_name.lower():
+            res = r
+            break
+    if res is None:
+        return json.dumps({"error": f"Resource '{resource_name}' not found."})
+
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+
+    max_units = res.MaxUnits  # e.g. 1.0 = 100%
+
+    periods = []
+    try:
+        # Resource TimeScaleData types differ from Task types:
+        # Type 13 = pjResourceTimescaledWork (minutes), Type 4 = Availability (units)
+        tsd = res.TimeScaleData(sd, ed, 13, ts)
+        for item in tsd:
+            try:
+                val = item.Value
+                allocated_hrs = float(val) / 60.0 if val else 0.0
+            except Exception:
+                allocated_hrs = 0.0
+            periods.append({
+                "start":          _fmt_date(item.StartDate),
+                "end":            _fmt_date(item.EndDate),
+                "allocated_hours": round(allocated_hrs, 2),
+            })
+    except Exception as e:
+        return json.dumps({"error": f"TimeScaleData failed: {e}"})
+
+    return json.dumps({
+        "resource":  res.Name,
+        "max_units": max_units,
+        "timescale": timescale,
+        "periods":   periods,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_variance_report(baseline: int = 0) -> str:
+    """
+    Schedule and cost variance per task compared to a baseline.
+
+    Args:
+        baseline: Baseline number (0-10). Default 0.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+    mpd  = _get_mpd(proj)
+
+    # Baseline property name mapping
+    BL_START  = f"Baseline{'' if baseline == 0 else baseline}Start"
+    BL_FINISH = f"Baseline{'' if baseline == 0 else baseline}Finish"
+    BL_COST   = f"Baseline{'' if baseline == 0 else baseline}Cost"
+
+    tasks = []
+    for t in proj.Tasks:
+        if t is None or t.Summary:
+            continue
+        try:
+            bl_start  = getattr(t, BL_START, None)
+            bl_finish = getattr(t, BL_FINISH, None)
+            bl_cost   = getattr(t, BL_COST, 0) or 0
+
+            sv_days = round(t.StartVariance / mpd, 2) if t.StartVariance else 0
+            fv_days = round(t.FinishVariance / mpd, 2) if t.FinishVariance else 0
+            cv      = round((t.Cost or 0) - bl_cost, 2)
+
+            tasks.append({
+                "unique_id":        t.UniqueID,
+                "name":             t.Name,
+                "start":            _fmt_date(t.Start),
+                "finish":           _fmt_date(t.Finish),
+                "baseline_start":   _fmt_date(bl_start),
+                "baseline_finish":  _fmt_date(bl_finish),
+                "start_variance_days":  sv_days,
+                "finish_variance_days": fv_days,
+                "cost":             round(t.Cost or 0, 2),
+                "baseline_cost":    round(bl_cost, 2),
+                "cost_variance":    cv,
+            })
+        except Exception:
+            continue
+
+    # Filter to only tasks with actual variance
+    with_variance = [t for t in tasks if t["start_variance_days"] != 0 or t["finish_variance_days"] != 0 or t["cost_variance"] != 0]
+
+    return json.dumps({
+        "baseline":       baseline,
+        "total_tasks":    len(tasks),
+        "with_variance":  len(with_variance),
+        "tasks":          with_variance if with_variance else tasks[:50],
+    }, indent=2)
+
+
+@mcp.tool()
+def snapshot_diff(path_a: str, path_b: str) -> str:
+    """
+    Compare two JSON snapshot files (from snapshot_to_json) and return
+    additions, deletions, and changes.
+
+    Args:
+        path_a: Path to the earlier snapshot JSON.
+        path_b: Path to the later snapshot JSON.
+    """
+    import os
+
+    for p in (path_a, path_b):
+        if not os.path.exists(p):
+            return json.dumps({"error": f"File not found: {p}"})
+
+    with open(path_a, "r", encoding="utf-8") as f:
+        snap_a = json.load(f)
+    with open(path_b, "r", encoding="utf-8") as f:
+        snap_b = json.load(f)
+
+    tasks_a = {t["unique_id"]: t for t in snap_a.get("tasks", [])}
+    tasks_b = {t["unique_id"]: t for t in snap_b.get("tasks", [])}
+
+    ids_a = set(tasks_a.keys())
+    ids_b = set(tasks_b.keys())
+
+    added   = [tasks_b[uid] for uid in sorted(ids_b - ids_a)]
+    deleted = [tasks_a[uid] for uid in sorted(ids_a - ids_b)]
+
+    changed = []
+    for uid in sorted(ids_a & ids_b):
+        a, b = tasks_a[uid], tasks_b[uid]
+        diffs = {}
+        for key in set(list(a.keys()) + list(b.keys())):
+            va, vb = a.get(key), b.get(key)
+            if va != vb:
+                diffs[key] = {"from": va, "to": vb}
+        if diffs:
+            changed.append({"unique_id": uid, "name": b.get("name", a.get("name")), "changes": diffs})
+
+    return json.dumps({
+        "added_count":   len(added),
+        "deleted_count": len(deleted),
+        "changed_count": len(changed),
+        "added":         added,
+        "deleted":       deleted,
+        "changed":       changed,
+    }, indent=2)
+
+
+@mcp.tool()
+def set_task_hyperlink(unique_id: int, url: str, text: str = "", sub_address: str = "") -> str:
+    """
+    Set a hyperlink on a task.
+
+    Args:
+        unique_id:   Task UniqueID.
+        url:         The hyperlink URL or file path.
+        text:        Display text for the hyperlink (optional).
+        sub_address: Sub-address / bookmark within the target (optional).
+    """
+    app  = get_app()
+    proj = get_proj(app)
+    t = _find_task(proj, unique_id)
+    if t is None:
+        return json.dumps({"error": f"Task UniqueID {unique_id} not found."})
+
+    t.HyperlinkAddress    = url
+    t.HyperlinkScreenTip  = text or url
+    if text:
+        t.Hyperlink = text
+    if sub_address:
+        t.HyperlinkSubAddress = sub_address
+
+    app.FileSave()
+    return json.dumps({
+        "status":    "updated",
+        "unique_id": unique_id,
+        "name":      t.Name,
+        "hyperlink": url,
+        "text":      text or url,
+    }, indent=2)
+
+
+@mcp.tool()
+def add_recurring_task(
+    name:            str,
+    recurrence_type: str = "weekly",
+    start_date:      str = "",
+    end_date:        str = "",
+    duration_days:   float = 1,
+    day_of_week:     int = 2,
+) -> str:
+    """
+    Add a recurring task to the project.
+
+    Args:
+        name:            Task name.
+        recurrence_type: 'daily', 'weekly', or 'monthly' (default 'weekly').
+        start_date:      Recurrence range start (YYYY-MM-DD).
+        end_date:        Recurrence range end (YYYY-MM-DD).
+        duration_days:   Duration of each occurrence in days (default 1).
+        day_of_week:     For weekly: 1=Sun, 2=Mon, ..., 7=Sat (default 2=Monday).
+    """
+    app  = get_app()
+    proj = get_proj(app)
+    mpd  = _get_mpd(proj)
+
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+    if sd is None or ed is None:
+        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD)."})
+
+    dur = int(duration_days * mpd)
+
+    # pjRecurType: 0=daily, 1=weekly, 2=monthly, 3=yearly
+    RECUR_MAP = {"daily": 0, "weekly": 1, "monthly": 2, "yearly": 3}
+    rt = RECUR_MAP.get(recurrence_type.lower())
+    if rt is None:
+        return json.dumps({"error": f"Unknown recurrence_type '{recurrence_type}'. Use: daily, weekly, monthly, yearly."})
+
+    try:
+        # MS Project's RecurringTaskInsert is a dialog-only COM method;
+        # it cannot be driven programmatically. Instead, we create individual
+        # task occurrences under a summary task to simulate recurrence.
+
+        from dateutil.rrule import rrule, DAILY, WEEKLY, MONTHLY, YEARLY
+        FREQ_MAP = {"daily": DAILY, "weekly": WEEKLY, "monthly": MONTHLY, "yearly": YEARLY}
+        freq = FREQ_MAP.get(recurrence_type.lower(), WEEKLY)
+
+        # Map day_of_week (1=Sun..7=Sat) to dateutil byweekday (0=Mon..6=Sun)
+        WEEKDAY_MAP = {1: 6, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}
+        byday = WEEKDAY_MAP.get(day_of_week, 0)
+
+        if freq == WEEKLY:
+            dates = list(rrule(freq, dtstart=sd, until=ed, byweekday=byday))
+        else:
+            dates = list(rrule(freq, dtstart=sd, until=ed))
+
+        if not dates:
+            return json.dumps({"error": "No occurrences generated for the given range."})
+
+        # Create summary task
+        summary = proj.Tasks.Add(name)
+        summary_uid = summary.UniqueID
+
+        # Create each occurrence as a subtask
+        occurrence_uids = []
+        for i, dt_occ in enumerate(dates, 1):
+            occ = proj.Tasks.Add(f"{name} #{i}")
+            occ.OutlineIndent()
+            occ.Start = dt_occ
+            occ.Duration = dur
+            occurrence_uids.append(occ.UniqueID)
+
+        app.CalculateProject()
+        app.FileSave()
+
+        return json.dumps({
+            "status":          "created",
+            "name":            name,
+            "unique_id":       summary_uid,
+            "recurrence_type": recurrence_type,
+            "occurrences":     len(dates),
+            "start":           start_date,
+            "end":             end_date,
+        }, indent=2)
+
+    except ImportError:
+        return json.dumps({"error": "python-dateutil is required for recurring tasks. Install with: pip install python-dateutil"})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to create recurring task: {e}"})
+
+
+@mcp.tool()
+def get_resource_rate_tables(resource_name: str) -> str:
+    """
+    Get cost rate tables (A through E) for a resource.
+
+    Args:
+        resource_name: Name of the resource.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    res = None
+    for r in proj.Resources:
+        if r is not None and r.Name and r.Name.lower() == resource_name.lower():
+            res = r
+            break
+    if res is None:
+        return json.dumps({"error": f"Resource '{resource_name}' not found."})
+
+    tables = {}
+    TABLE_NAMES = ["A", "B", "C", "D", "E"]
+
+    for idx, tname in enumerate(TABLE_NAMES):
+        try:
+            table = res.CostRateTables(idx + 1)
+            rates = []
+            for pay_rate in table.PayRates:
+                rates.append({
+                    "effective_date":  _fmt_date(pay_rate.EffectiveDate),
+                    "standard_rate":   str(pay_rate.StandardRate),
+                    "overtime_rate":   str(pay_rate.OvertimeRate),
+                    "cost_per_use":    float(pay_rate.CostPerUse) if pay_rate.CostPerUse else 0.0,
+                })
+            tables[tname] = rates
+        except Exception:
+            tables[tname] = []
+
+    return json.dumps({
+        "resource": res.Name,
+        "tables":   tables,
+    }, indent=2)
+
+
+@mcp.tool()
+def set_resource_rate_table(
+    resource_name: str,
+    table:         str = "A",
+    standard_rate: str = "",
+    overtime_rate: str = "",
+    cost_per_use:  float = -1,
+    effective_date: str = "",
+) -> str:
+    """
+    Set or add a cost rate entry in a resource's rate table.
+
+    Args:
+        resource_name:  Name of the resource.
+        table:          Rate table letter: A, B, C, D, or E (default A).
+        standard_rate:  Standard rate as string, e.g. '50/h' or '400/d'.
+        overtime_rate:  Overtime rate as string, e.g. '75/h'.
+        cost_per_use:   Per-use cost (default -1 = don't change).
+        effective_date: When this rate takes effect (YYYY-MM-DD). Empty = first entry.
+    """
+    app  = get_app()
+    proj = get_proj(app)
+
+    TABLE_MAP = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5}
+    tbl_idx = TABLE_MAP.get(table.upper())
+    if tbl_idx is None:
+        return json.dumps({"error": f"Invalid table '{table}'. Use A-E."})
+
+    res = None
+    for r in proj.Resources:
+        if r is not None and r.Name and r.Name.lower() == resource_name.lower():
+            res = r
+            break
+    if res is None:
+        return json.dumps({"error": f"Resource '{resource_name}' not found."})
+
+    try:
+        rate_table = res.CostRateTables(tbl_idx)
+        pay_rates  = rate_table.PayRates
+
+        if effective_date:
+            # Add a new rate entry with effective date
+            ed = _parse_date(effective_date)
+            new_rate = pay_rates.Add(ed)
+            if standard_rate:
+                new_rate.StandardRate = standard_rate
+            if overtime_rate:
+                new_rate.OvertimeRate = overtime_rate
+            if cost_per_use >= 0:
+                new_rate.CostPerUse = cost_per_use
+        else:
+            # Update the first (default) rate entry
+            first = pay_rates(1)
+            if standard_rate:
+                first.StandardRate = standard_rate
+            if overtime_rate:
+                first.OvertimeRate = overtime_rate
+            if cost_per_use >= 0:
+                first.CostPerUse = cost_per_use
+
+        app.FileSave()
+        return json.dumps({
+            "status":   "updated",
+            "resource": res.Name,
+            "table":    table.upper(),
+            "standard_rate": standard_rate or "(unchanged)",
+            "overtime_rate": overtime_rate or "(unchanged)",
+            "cost_per_use":  cost_per_use if cost_per_use >= 0 else "(unchanged)",
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": f"Failed to update rate table: {e}"})
 
 
 # ---------------------------------------------------------------------------
