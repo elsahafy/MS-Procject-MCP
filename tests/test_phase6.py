@@ -1,5 +1,5 @@
 """
-Phase 6 Tests — Gap Analysis & Missing Features (17 new tools + enriched task_to_dict)
+Phase 6 Tests — Gap Analysis & Missing Features (18 new tools + enriched task_to_dict)
 Run: python test_phase6.py
 Requires: MS Project running (will be launched if not)
 """
@@ -374,6 +374,23 @@ async def run_tests():
         ok("set_rate_table table",  r.get("table") == "A")
     else:
         skip("set_resource_rate_table", f"may need specific setup: {r.get('error', '')[:80]}")
+
+    # -------------------------------------------------------------------
+    # 20. set_task_calendar
+    # -------------------------------------------------------------------
+    print("\n=== 20. set_task_calendar ===")
+    if uid_gamma:
+        # Create a calendar to assign
+        await call("create_calendar", name="Task Specific Cal", copy_from="Standard")
+        r = await call("set_task_calendar", unique_id=uid_gamma, calendar_name="Task Specific Cal")
+        ok("set_task_calendar status", r.get("status") == "updated")
+        ok("set_task_calendar calendar", r.get("calendar") == "Task Specific Cal")
+
+        # Non-existent calendar
+        r2 = await call("set_task_calendar", unique_id=uid_gamma, calendar_name="NoSuchCal")
+        ok("set_task_calendar bad cal", "error" in r2)
+    else:
+        skip("set_task_calendar", "no task")
 
     # -------------------------------------------------------------------
     # Cleanup
