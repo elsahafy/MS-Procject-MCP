@@ -82,7 +82,7 @@ python server.py
 
 | Tool | Description |
 |------|-------------|
-| `add_predecessor` | Create FS/SS/FF/SF link with optional lag |
+| `add_predecessor` | Create FC/CC/FF/CF (FS/SS/FF/SF) link with optional lag |
 | `bulk_add_predecessors` | Mass predecessor creation |
 | `remove_predecessor` | Delete a dependency link |
 | `get_task_dependencies` | Show predecessors and successors |
@@ -259,6 +259,23 @@ Every task query (`get_task`, `get_tasks`, etc.) returns a rich dict with 35+ fi
 | `manual` | Auto vs manual scheduling |
 | `type` | FixedUnits / FixedDuration / FixedWork |
 | `hyperlink` / `hyperlink_text` | Task hyperlink |
+
+## Configuración regional (MS Project en español)
+
+El servidor funciona con MS Project en español y en inglés:
+
+- **Tipos de vínculo**: acepta `FC`, `CC`, `FF`, `CF` y también los códigos en inglés `FS`, `SS`, `FF`, `SF`. Los vínculos se crean con `TaskDependencies.Add`, que no depende del idioma, y en las respuestas se usan los códigos del idioma de Project (`FC` en español).
+- **Separador de lista**: los campos `Predecessors` y `ResourceNames` usan el separador de lista de Windows (`;` en español, `,` en inglés).
+- **Decimales**: las posposiciones (lag) se escriben con el separador decimal regional (`+1,5d`).
+- **Fechas de entrada**: siempre se acepta `AAAA-MM-DD`. Con Project en español también `DD/MM/AAAA` (y `DD-MM-AAAA`, `DD.MM.AAAA`, con hora opcional), que se leen siempre día primero. Con Project en inglés solo se acepta el formato ISO, para no confundir `MM/DD` con `DD/MM`. Se pasan a COM como objetos `datetime`, así que no dependen del formato de fecha de Windows.
+- **Fechas de salida**: siempre en ISO (`AAAA-MM-DD` / `AAAA-MM-DD HH:MM:SS`), sin importar la configuración regional.
+- **Exportar CSV**: `export_csv` usa el separador de lista y el decimal regionales, con BOM UTF-8, para que Excel en español lo abra directamente.
+
+El idioma se detecta con `app.LanguageSettings` y los separadores con el registro de Windows (`HKCU\Control Panel\International`). Si quieres fijarlos a mano, usa estas variables de entorno en `claude_desktop_config.json`:
+
+```json
+"env": { "MSP_LANG": "es", "MSP_LIST_SEP": ";", "MSP_DECIMAL": "," }
+```
 
 ## Known Limitations
 

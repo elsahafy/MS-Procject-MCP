@@ -25,6 +25,7 @@ def get_app(require_project=True):
         raise RuntimeError(
             "MS Project is not running. Open MS Project and load a file first."
         )
+    _locale(app)
     if require_project and app.Projects.Count == 0:
         raise RuntimeError(
             "No project file is open in MS Project. Please open a file first."
@@ -44,11 +45,230 @@ def _get_mpd(proj):
         return 480
 
 
+# ---------------------------------------------------------------------------
+# Locale helpers (Spanish / English MS Project)
+#
+# MS Project writes and parses text fields such as Predecessors and
+# ResourceNames using the Windows list separator (";" in most Spanish
+# locales, "," in English) and localized link-type codes:
+#     EN: FS  SS  FF  SF
+#     ES: FC  CC  FF  CF
+# The settings are auto-detected and can be forced with environment variables:
+#     MSP_LANG      = "es" | "en"
+#     MSP_LIST_SEP  = ";" | ","
+#     MSP_DECIMAL   = "," | "."
+# ---------------------------------------------------------------------------
+
+import os
+
+# pjTaskLinkType constants (language-independent)
+LINK_CODES = {
+    "en": {0: "FF", 1: "FS", 2: "SF", 3: "SS"},
+    "es": {0: "FF", 1: "FC", 2: "CF", 3: "CC"},
+}
+# Every accepted spelling -> pjTaskLinkType constant
+_LINK_ALIASES = {
+    "FS": 1, "FC": 1, "FIN-COMIENZO": 1, "FIN A COMIENZO": 1, "FINISH-TO-START": 1,
+    "SS": 3, "CC": 3, "COMIENZO-COMIENZO": 3, "COMIENZO A COMIENZO": 3, "START-TO-START": 3,
+    "FF": 0, "FIN-FIN": 0, "FIN A FIN": 0, "FINISH-TO-FINISH": 0,
+    "SF": 2, "CF": 2, "COMIENZO-FIN": 2, "COMIENZO A FIN": 2, "START-TO-FINISH": 2,
+}
+
+_locale_cache = {}
+
+
+def _read_intl_setting(name):
+    """Read a value from HKCU\\Control Panel\\International (Windows only)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International") as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except Exception:
+        return None
+
+
+def _build_locale(lang):
+    list_sep = (
+        os.environ.get("MSP_LIST_SEP") or _read_intl_setting("sList")
+        or (";" if lang == "es" else ",")
+    )
+    decimal = (
+        os.environ.get("MSP_DECIMAL") or _read_intl_setting("sDecimal")
+        or ("," if lang == "es" else ".")
+    )
+    if list_sep == decimal:
+        # Misconfigured env vars or an unusual regional setting could resolve
+        # both to the same character, which corrupts lag/predecessor strings
+        # like '5FC+1,5d' once _split_list and _lag_string disagree on what
+        # the separator even is. Force decimal to whichever of '.'/',' differs.
+        decimal = "." if list_sep != "." else ","
+    return {"lang": lang, "list_sep": list_sep, "decimal": decimal}
+
+
+def _locale(app=None):
+    """
+    Return the locale settings: {'lang', 'list_sep', 'decimal'}.
+    Only an explicit MSP_LANG or a successful MS Project UI-language probe is
+    cached. Otherwise the language is guessed from the Windows locale
+    (LocaleName, e.g. 'es-PE') and left uncached so a later call can retry.
+    An explicit MSP_LANG always wins, even over an already-cached probe
+    result, so it can be used to override or reset detection without
+    restarting the server process.
+    """
+    env_lang = (os.environ.get("MSP_LANG") or "").strip().lower()[:2]
+    if env_lang in ("es", "en") and _locale_cache.get("lang") != env_lang:
+        _locale_cache.clear()
+        _locale_cache.update(_build_locale(env_lang))
+        return _locale_cache
+
+    if "lang" in _locale_cache:
+        return _locale_cache
+
+    lang = env_lang
+    if lang not in ("es", "en") and app is not None:
+        try:
+            # msoLanguageIDUI = 2; primary language 0x0A = Spanish
+            lid = int(app.LanguageSettings.LanguageID(2))
+            lang = "es" if (lid & 0x3FF) == 0x0A else "en"
+        except Exception:
+            lang = ""
+    if lang in ("es", "en"):
+        _locale_cache.update(_build_locale(lang))
+        return _locale_cache
+
+    # Default to English when the language truly can't be determined (COM probe
+    # failed and the registry LocaleName is unreadable, e.g. a non-Windows host
+    # or a transient COM hiccup). English is the safe failure mode: day-first
+    # dates simply get rejected instead of being silently misread as DD/MM.
+    win_lang = (_read_intl_setting("LocaleName") or "").strip().lower()[:2]
+    return _build_locale("es" if win_lang == "es" else "en")
+
+
+def _list_sep():
+    return _locale()["list_sep"]
+
+
+def _split_list(value):
+    """Split a Project list field (Predecessors, ResourceNames) into items."""
+    if not value:
+        return []
+    sep = _list_sep()
+    return [p.strip() for p in str(value).split(sep) if p.strip()]
+
+
+def _join_list(items):
+    return _list_sep().join(items)
+
+
+def _link_type_id(link_type):
+    """Map 'FS'/'FC'/'SS'/'CC'/'FF'/'SF'/'CF' (or the constant) to pjTaskLinkType."""
+    if link_type is None or link_type == "":
+        return 1
+    if isinstance(link_type, int):
+        if link_type in (0, 1, 2, 3):
+            return link_type
+        raise ValueError(f"Invalid link type: {link_type}")
+    key = str(link_type).strip().upper()
+    if key not in _LINK_ALIASES:
+        raise ValueError(
+            f"Invalid link type '{link_type}'. Use FC/CC/FF/CF (es) or FS/SS/FF/SF (en)."
+        )
+    return _LINK_ALIASES[key]
+
+
+def _link_code(type_id):
+    """pjTaskLinkType constant -> code in the Project language (e.g. 1 -> 'FC')."""
+    return LINK_CODES[_locale()["lang"]].get(type_id, str(type_id))
+
+
+def _lag_string(lag_days):
+    """Build a lag suffix like '+2d' / '-1,5d' using the locale decimal separator."""
+    if not lag_days:
+        return ""
+    num = f"{lag_days:+g}".replace(".", _locale()["decimal"])
+    return f"{num}d"
+
+
+def _pred_task_id(part):
+    """Extract the task ID from a predecessor item like '5FC+2d' or 'Proj\\5'."""
+    part = part.split("\\")[-1].strip()
+    num = ""
+    for ch in part:
+        if ch.isdigit():
+            num += ch
+        else:
+            break
+    return num
+
+
+# Year-first formats are unambiguous and always accepted.
+_ISO_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+    "%Y/%m/%d",
+)
+# Day-first formats: always read as DD/MM (never MM/DD). Accepted only when
+# the Project language is Spanish, so an English MM/DD/YYYY date is rejected
+# instead of being silently swapped.
+_DAY_FIRST_FORMATS = (
+    "%d/%m/%Y", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%y",
+    "%d-%m-%Y", "%d-%m-%Y %H:%M", "%d.%m.%Y",
+)
+
+
 def _parse_date(s):
-    """Parse YYYY-MM-DD string to datetime for COM. Returns None if empty."""
+    """
+    Parse a date string to datetime for COM. Returns None if empty.
+    Accepts ISO (YYYY-MM-DD) always. With a Spanish Project it also accepts
+    day-first formats (DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY), optionally
+    followed by a time; these are always read day first, never as MM/DD.
+    The datetime object is passed to COM, so it does not depend on the
+    Windows date format.
+    """
     if not s:
         return None
-    return datetime.datetime.strptime(s, "%Y-%m-%d")
+    if isinstance(s, datetime.datetime):
+        return s
+    if isinstance(s, datetime.date):
+        return datetime.datetime(s.year, s.month, s.day)
+    txt = str(s).strip()
+    day_first = _locale()["lang"] == "es"
+    formats = _ISO_DATE_FORMATS + (_DAY_FIRST_FORMATS if day_first else ())
+    for fmt_ in formats:
+        try:
+            return datetime.datetime.strptime(txt, fmt_)
+        except ValueError:
+            continue
+    hint = "YYYY-MM-DD or DD/MM/YYYY" if day_first else "YYYY-MM-DD"
+    raise ValueError(f"Unrecognized date '{s}'. Use {hint}.")
+
+
+def _iso(dt, with_time=False):
+    """
+    Format a COM date as ISO text independent of the Windows locale.
+    Returns None for empty values or Project's 'NA' date.
+    """
+    if dt is None or dt == "":
+        return None
+    try:
+        if hasattr(dt, "year"):
+            # MS Project's 'NA' / 'ND' sentinel is commonly documented around
+            # year 4148+ in the COM layer. 2149 was too close to plausible
+            # real dates (e.g. deliberate long-range planning data), so this
+            # uses a wider margin — verify against a real MS Project instance
+            # if the sentinel's exact value is known for your installation.
+            if dt.year >= 4000:
+                return None
+            return dt.strftime("%Y-%m-%d %H:%M:%S" if with_time else "%Y-%m-%d")
+        txt = str(dt)
+        if txt.upper() in ("NA", "ND"):
+            return None
+        d = _parse_date(txt[:19] if "-" in txt[:10] else txt)
+        return d.strftime("%Y-%m-%d %H:%M:%S" if with_time else "%Y-%m-%d")
+    except Exception:
+        try:
+            return str(dt)[:19 if with_time else 10]
+        except Exception:
+            return None
 
 
 def task_to_dict(t, proj):
@@ -57,9 +277,7 @@ def task_to_dict(t, proj):
 
     def fmt(dt):
         try:
-            if dt is None:
-                return None
-            return str(dt)[:19]
+            return _iso(dt, with_time=True)
         except Exception:
             return None
 
@@ -128,7 +346,7 @@ def _count_resources(proj):
 def _fmt_date(dt):
     """Format a COM date to 'YYYY-MM-DD' string. Returns None on failure."""
     try:
-        return str(dt)[:10] if dt else None
+        return _iso(dt) if dt else None
     except Exception:
         return None
 
@@ -199,6 +417,7 @@ def open_project(file_path: str) -> str:
         app.Visible = True
         app.DisplayAlerts = False
 
+    _locale(app)
     app.FileOpen(file_path)
     proj = app.ActiveProject
     return json.dumps({
@@ -206,8 +425,8 @@ def open_project(file_path: str) -> str:
         "name":       proj.Name,
         "full_path":  proj.FullName,
         "task_count": proj.Tasks.Count,
-        "start":      str(proj.ProjectStart)[:10],
-        "finish":     str(proj.ProjectFinish)[:10],
+        "start":      _iso(proj.ProjectStart),
+        "finish":     _iso(proj.ProjectFinish),
     }, indent=2)
 
 
@@ -218,7 +437,7 @@ def new_project(title: str = "New Project", start: str = "") -> str:
 
     Args:
         title: Project title (default "New Project").
-        start: Project start date as YYYY-MM-DD (optional).
+        start: Project start date as YYYY-MM-DD or DD/MM/YYYY (optional).
     """
     import win32com.client
     try:
@@ -228,6 +447,7 @@ def new_project(title: str = "New Project", start: str = "") -> str:
         app.Visible = True
         app.DisplayAlerts = False
 
+    _locale(app)
     app.FileNew()
     proj = app.ActiveProject
     proj.Title = title
@@ -238,7 +458,7 @@ def new_project(title: str = "New Project", start: str = "") -> str:
         "status": "created",
         "title":  proj.Title,
         "name":   proj.Name,
-        "start":  str(proj.ProjectStart)[:10],
+        "start":  _iso(proj.ProjectStart),
     }, indent=2)
 
 
@@ -251,7 +471,7 @@ def get_project_info() -> str:
 
     def fmt(dt):
         try:
-            return str(dt)[:10] if dt else None
+            return _iso(dt) if dt else None
         except Exception:
             return None
 
@@ -295,8 +515,8 @@ def set_project_properties(properties_json: str) -> str:
 
     Args:
         properties_json: JSON string with fields to set. All optional:
-            title, manager, company, author, subject, status_date (YYYY-MM-DD),
-            start (YYYY-MM-DD).
+            title, manager, company, author, subject, status_date (YYYY-MM-DD or DD/MM/YYYY),
+            start (YYYY-MM-DD or DD/MM/YYYY).
             Example: '{"title": "EXPO 2030", "manager": "John", "company": "ERC"}'
     """
     props = json.loads(properties_json)
@@ -508,8 +728,8 @@ def update_task(
         name:             New task name.
         percent_complete: 0-100.
         notes:            Free-text notes.
-        start:            Start date as YYYY-MM-DD.
-        finish:           Finish date as YYYY-MM-DD.
+        start:            Start date as YYYY-MM-DD or DD/MM/YYYY.
+        finish:           Finish date as YYYY-MM-DD or DD/MM/YYYY.
         duration_days:    Duration in working days (0+ to set).
         manual:           True for manually scheduled, False for auto-scheduled.
         rag:              RAG status: 'Red', 'Amber', or 'Green' (stored in Text1).
@@ -683,8 +903,8 @@ def add_task(
     Args:
         name:            Task name (required).
         outline_level:   WBS level (1 = top-level, 2 = sub-task, etc.).
-        start:           Start date YYYY-MM-DD (optional).
-        finish:          Finish date YYYY-MM-DD (optional).
+        start:           Start date YYYY-MM-DD or DD/MM/YYYY (optional).
+        finish:          Finish date YYYY-MM-DD or DD/MM/YYYY (optional).
         duration_days:   Duration in days (default 1).
         milestone:       True to create as a milestone.
         notes:           Free-text notes.
@@ -907,7 +1127,7 @@ def set_constraint(unique_id: int, constraint_type: str = "SNET", constraint_dat
     Args:
         unique_id:       Task UniqueID (required).
         constraint_type: One of: ASAP, ALAP, MSO, MFO, SNET, SNLT, FNET, FNLT (default SNET).
-        constraint_date: Date as YYYY-MM-DD (required for all types except ASAP/ALAP).
+        constraint_date: Date as YYYY-MM-DD or DD/MM/YYYY (required for all types except ASAP/ALAP).
     """
     CONSTRAINT_MAP = {
         "ASAP": 0, "ALAP": 1, "MSO": 2, "MFO": 3,
@@ -1001,12 +1221,36 @@ def rename_custom_fields(fields_json: str) -> str:
 # TOOLS — Dependencies
 # ---------------------------------------------------------------------------
 
+def _add_link(succ_task, pred_task, link_type, lag_days, mpd):
+    """
+    Link pred_task -> succ_task. Uses TaskDependencies.Add (language-independent);
+    falls back to writing the localized Predecessors text, e.g. '5FC+2d' joined
+    with the Windows list separator, only if that call itself isn't usable.
+    Returns (pred_text, via_com): pred_text is the predecessor text as MS Project
+    shows it (e.g. '5FC+2d'). via_com is False when the COM call failed and the
+    text fallback was used instead — callers must treat that as unverified,
+    since MS Project never validated or enforced the dependency in that case
+    (e.g. a rejected circular link would also hit this path).
+    """
+    type_id = _link_type_id(link_type)
+    lag_str = _lag_string(lag_days)
+    pred_text = f"{pred_task.ID}{_link_code(type_id)}{lag_str}"
+    try:
+        succ_task.TaskDependencies.Add(pred_task, type_id, int(round((lag_days or 0) * mpd)))
+        return pred_text, True
+    except Exception:
+        items = _split_list(succ_task.Predecessors)
+        items.append(pred_text)
+        succ_task.Predecessors = _join_list(items)
+        return pred_text, False
+
+
 @mcp.tool()
 def add_predecessor(
     successor_unique_id:   int,
     predecessor_unique_id: int,
-    link_type:             str = "FS",
-    lag_days:              int = 0,
+    link_type:             str = "FC",
+    lag_days:              float = 0,
 ) -> str:
     """
     Add a predecessor link between two tasks.
@@ -1014,11 +1258,13 @@ def add_predecessor(
     Args:
         successor_unique_id:   The task that depends on the predecessor.
         predecessor_unique_id: The task that must finish/start first.
-        link_type:             'FS' (default), 'SS', 'FF', or 'SF'.
+        link_type:             'FC' (fin-comienzo, default), 'CC', 'FF' or 'CF'.
+                               English codes 'FS', 'SS', 'FF', 'SF' are also accepted.
         lag_days:              Lag in days (positive = lag, negative = lead).
     """
     app  = get_app()
     proj = get_proj(app)
+    mpd  = _get_mpd(proj)
 
     uid_to_id = {t.UniqueID: t.ID for t in proj.Tasks if t is not None}
 
@@ -1027,35 +1273,30 @@ def add_predecessor(
     if predecessor_unique_id not in uid_to_id:
         return json.dumps({"error": f"Predecessor UniqueID {predecessor_unique_id} not found."})
 
-    pred_id = uid_to_id[predecessor_unique_id]
-    succ_task = None
-    for t in proj.Tasks:
-        if t is not None and t.UniqueID == successor_unique_id:
-            succ_task = t
-            break
+    try:
+        _link_type_id(link_type)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
-    lag_str = ""
-    if lag_days > 0:
-        lag_str = f"+{lag_days}d"
-    elif lag_days < 0:
-        lag_str = f"{lag_days}d"
+    succ_task = _find_task(proj, successor_unique_id)
+    pred_task = _find_task(proj, predecessor_unique_id)
 
-    existing = succ_task.Predecessors.strip()
-    new_pred  = f"{pred_id}{link_type}{lag_str}"
-
-    if existing:
-        succ_task.Predecessors = existing + "," + new_pred
-    else:
-        succ_task.Predecessors = new_pred
+    new_pred, via_com = _add_link(succ_task, pred_task, link_type, lag_days, mpd)
 
     app.FileSave()
-    return json.dumps({
-        "status":       "linked",
+    result = {
+        "status":       "linked" if via_com else "linked_unverified",
         "successor":    successor_unique_id,
         "predecessor":  predecessor_unique_id,
         "link":         new_pred,
         "predecessors": succ_task.Predecessors,
-    }, indent=2)
+    }
+    if not via_com:
+        result["warning"] = (
+            "TaskDependencies.Add() failed; wrote the predecessor as text only — "
+            "MS Project may not validate or enforce this link."
+        )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -1065,12 +1306,14 @@ def bulk_add_predecessors(links_json: str) -> str:
 
     Args:
         links_json: JSON string — list of link objects:
-            [{successor_unique_id, predecessor_unique_id, link_type (default "FS"), lag_days (default 0)}]
-            Example: '[{"successor_unique_id": 10, "predecessor_unique_id": 5, "link_type": "FS"}]'
+            [{successor_unique_id, predecessor_unique_id, link_type (default "FC"), lag_days (default 0)}]
+            link_type: 'FC', 'CC', 'FF', 'CF' (English 'FS', 'SS', 'FF', 'SF' also accepted).
+            Example: '[{"successor_unique_id": 10, "predecessor_unique_id": 5, "link_type": "FC"}]'
     """
     links = json.loads(links_json)
     app   = get_app()
     proj  = get_proj(app)
+    mpd   = _get_mpd(proj)
 
     uid_to_id = {t.UniqueID: t.ID for t in proj.Tasks if t is not None}
     uid_to_task = {t.UniqueID: t for t in proj.Tasks if t is not None}
@@ -1081,7 +1324,7 @@ def bulk_add_predecessors(links_json: str) -> str:
     for link in links:
         succ_uid = link["successor_unique_id"]
         pred_uid = link["predecessor_unique_id"]
-        lt       = link.get("link_type", "FS")
+        lt       = link.get("link_type", "FC")
         lag      = link.get("lag_days", 0)
 
         if succ_uid not in uid_to_id:
@@ -1091,22 +1334,20 @@ def bulk_add_predecessors(links_json: str) -> str:
             errors.append({"predecessor_unique_id": pred_uid, "error": "not found"})
             continue
 
-        pred_id   = uid_to_id[pred_uid]
-        succ_task = uid_to_task[succ_uid]
+        try:
+            _, via_com = _add_link(uid_to_task[succ_uid], uid_to_task[pred_uid], lt, lag, mpd)
+        except Exception as e:
+            errors.append({"successor_unique_id": succ_uid,
+                           "predecessor_unique_id": pred_uid, "error": str(e)})
+            continue
 
-        lag_str = ""
-        if lag > 0:
-            lag_str = f"+{lag}d"
-        elif lag < 0:
-            lag_str = f"{lag}d"
-
-        new_pred = f"{pred_id}{lt}{lag_str}"
-        existing = succ_task.Predecessors.strip()
-
-        if existing:
-            succ_task.Predecessors = existing + "," + new_pred
-        else:
-            succ_task.Predecessors = new_pred
+        if not via_com:
+            errors.append({
+                "successor_unique_id": succ_uid,
+                "predecessor_unique_id": pred_uid,
+                "error": "TaskDependencies.Add() failed; wrote as unverified text predecessor, not counted as linked",
+            })
+            continue
 
         linked += 1
 
@@ -1138,13 +1379,46 @@ def remove_predecessor(
             succ_task = t
             break
 
-    existing = succ_task.Predecessors.strip()
-    if not existing:
-        return json.dumps({"status": "no_change", "message": "Task has no predecessors."})
+    if pred_id is None:
+        return json.dumps({"error": f"Predecessor UniqueID {predecessor_unique_id} not found."})
 
-    parts     = [p.strip() for p in existing.split(",")]
-    filtered  = [p for p in parts if not p.startswith(str(pred_id))]
-    succ_task.Predecessors = ",".join(filtered)
+    # Try the COM-based delete first regardless of what the text Predecessors
+    # field currently shows — TaskDependencies is the authoritative link store,
+    # and the two can be out of sync.
+    removed = False
+    com_error = None
+    try:
+        for dep in list(succ_task.TaskDependencies):
+            if dep.To.UniqueID == successor_unique_id and dep.From.UniqueID == predecessor_unique_id:
+                try:
+                    dep.Delete()
+                    removed = True
+                except Exception as e:
+                    # Don't let one failed Delete() abort remaining matches.
+                    com_error = str(e)
+    except Exception as e:
+        com_error = str(e)
+
+    existing = (succ_task.Predecessors or "").strip()
+    if not removed and existing:
+        # Fallback: edit the current localized Predecessors text (exact ID
+        # match). pred_id comes from uid_to_id, which is scoped to this
+        # project's tasks only — a cross-project item like 'Other.mpp\5FC'
+        # has its own task numbered 5 in a DIFFERENT file, so matching it
+        # against pred_id by number alone would risk deleting an unrelated
+        # link on a numeric coincidence. Skip cross-project items entirely;
+        # predecessor_unique_id can never legitimately identify one anyway.
+        parts    = _split_list(succ_task.Predecessors)
+        filtered = [p for p in parts if "\\" in p or _pred_task_id(p) != str(pred_id)]
+        if len(filtered) != len(parts):
+            succ_task.Predecessors = _join_list(filtered)
+            removed = True
+
+    if not removed:
+        result = {"status": "no_change", "message": "Predecessor link not found."}
+        if com_error:
+            result["warning"] = f"TaskDependencies deletion raised: {com_error}"
+        return json.dumps(result, indent=2)
 
     app.FileSave()
     return json.dumps({
@@ -1179,6 +1453,7 @@ def get_task_dependencies(unique_id: int) -> str:
                     "unique_id": dep.From.UniqueID,
                     "name":      dep.From.Name,
                     "type":      dep.Type,
+                    "link_type": _link_code(dep.Type),
                     "lag_days":  round(dep.Lag / mpd, 2),
                 })
     except Exception:
@@ -1192,6 +1467,7 @@ def get_task_dependencies(unique_id: int) -> str:
                     "unique_id": dep.To.UniqueID,
                     "name":      dep.To.Name,
                     "type":      dep.Type,
+                    "link_type": _link_code(dep.Type),
                     "lag_days":  round(dep.Lag / mpd, 2),
                 })
     except Exception:
@@ -1308,9 +1584,9 @@ def assign_resource(task_unique_id: int, resource_name: str, units: float = 1.0)
     existing = (task.ResourceNames or "").strip()
     if existing:
         # Check if already assigned
-        existing_names = [n.strip().lower() for n in existing.split(",")]
+        existing_names = [n.lower() for n in _split_list(existing)]
         if resource_name.lower() not in existing_names:
-            task.ResourceNames = existing + "," + resource_name
+            task.ResourceNames = existing + _list_sep() + resource_name
     else:
         task.ResourceNames = resource_name
 
@@ -1469,7 +1745,7 @@ def get_wbs_structure(max_level: int = 0) -> str:
 
     def fmt(dt):
         try:
-            return str(dt)[:10] if dt else None
+            return _iso(dt) if dt else None
         except Exception:
             return None
 
@@ -1556,7 +1832,7 @@ def get_schedule_analysis() -> str:
 
     def fmt(dt):
         try:
-            return str(dt)[:10] if dt else None
+            return _iso(dt) if dt else None
         except Exception:
             return None
 
@@ -1999,7 +2275,7 @@ def group_tasks_by(field: str, include_tasks: bool = False) -> str:
 
         if field == "resource":
             # Split comma-separated resource names
-            names = [n.strip() for n in (t.ResourceNames or "").split(",") if n.strip()]
+            names = _split_list(t.ResourceNames)
             if not names:
                 names = ["(unassigned)"]
             keys = names
@@ -2072,8 +2348,8 @@ def set_calendar_exception(
     Args:
         calendar_name: Name of the base calendar (e.g. 'Standard').
         name:          Exception name (e.g. 'National Day').
-        start:         Start date as YYYY-MM-DD.
-        finish:        End date as YYYY-MM-DD (same as start for single day).
+        start:         Start date as YYYY-MM-DD or DD/MM/YYYY.
+        finish:        End date as YYYY-MM-DD or DD/MM/YYYY (same as start for single day).
         working:       True for a working exception, False for non-working/holiday (default).
     """
     app  = get_app()
@@ -2365,16 +2641,9 @@ def validate_schedule() -> str:
             other_preds = (other.Predecessors or "").strip()
             if other_preds:
                 # Check if our task ID appears in other's predecessors
-                for part in other_preds.split(","):
-                    part = part.strip()
-                    # Extract the numeric ID from predecessor string like "5FS" or "5"
-                    num = ""
-                    for ch in part:
-                        if ch.isdigit():
-                            num += ch
-                        else:
-                            break
-                    if num == task_id_str:
+                for part in _split_list(other_preds):
+                    # Extract the numeric ID from predecessor string like "5FC" or "5"
+                    if _pred_task_id(part) == task_id_str:
                         has_successor = True
                         break
             if has_successor:
@@ -2517,8 +2786,8 @@ def get_resource_workload(resource_name: str, start_date: str = "", end_date: st
 
     Args:
         resource_name: Resource name (case-insensitive exact match).
-        start_date:    Filter assignments starting after this date (YYYY-MM-DD, optional).
-        end_date:      Filter assignments ending before this date (YYYY-MM-DD, optional).
+        start_date:    Filter assignments starting after this date (YYYY-MM-DD or DD/MM/YYYY, optional).
+        end_date:      Filter assignments ending before this date (YYYY-MM-DD or DD/MM/YYYY, optional).
     """
     app  = get_app()
     proj = get_proj(app)
@@ -2640,7 +2909,7 @@ def set_deadline(unique_id: int, deadline_date: str) -> str:
 
     Args:
         unique_id:     Task UniqueID (required).
-        deadline_date: Deadline as YYYY-MM-DD, or 'clear' to remove.
+        deadline_date: Deadline as YYYY-MM-DD or DD/MM/YYYY, or 'clear' to remove.
     """
     app  = get_app()
     proj = get_proj(app)
@@ -3011,9 +3280,9 @@ def bulk_assign_resources(assignments_json: str) -> str:
             # Append to ResourceNames
             existing = (t.ResourceNames or "").strip()
             if existing:
-                existing_names = [n.strip().lower() for n in existing.split(",")]
+                existing_names = [n.lower() for n in _split_list(existing)]
                 if res_name.lower() not in existing_names:
-                    t.ResourceNames = existing + "," + res_name
+                    t.ResourceNames = existing + _list_sep() + res_name
             else:
                 t.ResourceNames = res_name
 
@@ -3049,13 +3318,13 @@ def remove_resource_assignment(task_unique_id: int, resource_name: str) -> str:
     if not existing:
         return json.dumps({"error": f"Task '{t.Name}' has no resources assigned."})
 
-    names = [n.strip() for n in existing.split(",")]
+    names = _split_list(existing)
     filtered = [n for n in names if n.lower() != resource_name.lower()]
 
     if len(filtered) == len(names):
         return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {existing}"})
 
-    t.ResourceNames = ",".join(filtered) if filtered else ""
+    t.ResourceNames = _join_list(filtered) if filtered else ""
 
     return json.dumps({
         "status":           "removed",
@@ -3283,7 +3552,7 @@ def copy_task_structure(source_unique_id: int, copies: int = 1) -> str:
 
 
 @mcp.tool()
-def cross_project_link(source_project: str, source_unique_id: int, target_project: str, target_unique_id: int, link_type: str = "FS") -> str:
+def cross_project_link(source_project: str, source_unique_id: int, target_project: str, target_unique_id: int, link_type: str = "FC") -> str:
     """
     Create a dependency link across open projects.
 
@@ -3292,9 +3561,13 @@ def cross_project_link(source_project: str, source_unique_id: int, target_projec
         source_unique_id:  UniqueID of the predecessor task.
         target_project:    Name of the successor's project.
         target_unique_id:  UniqueID of the successor task.
-        link_type:         'FS' (default), 'SS', 'FF', or 'SF'.
+        link_type:         'FC' (default), 'CC', 'FF' or 'CF' (English 'FS', 'SS', 'FF', 'SF' also accepted).
     """
     app = get_app(require_project=False)
+    try:
+        type_id = _link_type_id(link_type)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
     # Find source project and task
     src_proj = None
@@ -3325,18 +3598,16 @@ def cross_project_link(source_project: str, source_unique_id: int, target_projec
         return json.dumps({"error": f"Target task UniqueID {target_unique_id} not found in '{tgt_proj.Name}'."})
 
     # Set cross-project predecessor using "ProjectName\TaskID" format
-    pred_str = f"{src_proj.Name}\\{src_task.ID}{link_type}"
-    existing = (tgt_task.Predecessors or "").strip()
-    if existing:
-        tgt_task.Predecessors = existing + "," + pred_str
-    else:
-        tgt_task.Predecessors = pred_str
+    pred_str = f"{src_proj.Name}\\{src_task.ID}{_link_code(type_id)}"
+    items = _split_list(tgt_task.Predecessors)
+    items.append(pred_str)
+    tgt_task.Predecessors = _join_list(items)
 
     return json.dumps({
         "status":  "linked",
         "source":  {"project": src_proj.Name, "task": src_task.Name, "unique_id": source_unique_id},
         "target":  {"project": tgt_proj.Name, "task": tgt_task.Name, "unique_id": target_unique_id},
-        "link_type": link_type,
+        "link_type": _link_code(type_id),
     }, indent=2)
 
 
@@ -3377,11 +3648,19 @@ def export_csv(output_path: str, columns_json: str = "", filters_json: str = "")
                 tasks.append(task_to_dict(t, proj))
 
     # Write CSV
-    with open(output_path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.writer(fp)
+    # Use the Windows list/decimal separators so Excel (es) opens it directly
+    dec = _locale()["decimal"]
+
+    def cell(v):
+        if isinstance(v, float) and dec != ".":
+            return str(v).replace(".", dec)
+        return v
+
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as fp:
+        writer = csv.writer(fp, delimiter=_list_sep())
         writer.writerow(columns)
         for task in tasks:
-            row = [task.get(col, "") for col in columns]
+            row = [cell(task.get(col, "")) for col in columns]
             writer.writerow(row)
 
     return json.dumps({
@@ -4054,14 +4333,14 @@ def update_project(complete_through: str, set_0_or_100: bool = False) -> str:
     Tasks that should have finished by the date get their % complete updated.
 
     Args:
-        complete_through: Date as YYYY-MM-DD — tasks scheduled through this date are updated.
+        complete_through: Date as YYYY-MM-DD or DD/MM/YYYY — tasks scheduled through this date are updated.
         set_0_or_100:     If True, tasks are set to 0% or 100% only (no partial). Default False.
     """
     app  = get_app()
     proj = get_proj(app)
     dt   = _parse_date(complete_through)
     if dt is None:
-        return json.dumps({"error": "complete_through date is required (YYYY-MM-DD)."})
+        return json.dumps({"error": "complete_through date is required (YYYY-MM-DD or DD/MM/YYYY)."})
 
     # COM VBA signature: UpdateProject(All, UpdateDate, Action)
     # All = True (entire project), UpdateDate = date, Action:
@@ -4093,7 +4372,7 @@ def reschedule_incomplete_work(reschedule_from: str = "") -> str:
     (or the project status date if not specified).
 
     Args:
-        reschedule_from: Date as YYYY-MM-DD. Empty = use project status date.
+        reschedule_from: Date as YYYY-MM-DD or DD/MM/YYYY. Empty = use project status date.
     """
     app  = get_app()
     proj = get_proj(app)
@@ -4120,7 +4399,7 @@ def reschedule_incomplete_work(reschedule_from: str = "") -> str:
 
     return json.dumps({
         "status": "rescheduled",
-        "reschedule_from": str(dt)[:10],
+        "reschedule_from": _iso(dt),
         "project": proj.Name,
     }, indent=2)
 
@@ -4236,8 +4515,8 @@ def get_timephased_data(
 
     Args:
         unique_id:  Task UniqueID.
-        start_date: Period start as YYYY-MM-DD.
-        end_date:   Period end as YYYY-MM-DD.
+        start_date: Period start as YYYY-MM-DD or DD/MM/YYYY.
+        end_date:   Period end as YYYY-MM-DD or DD/MM/YYYY.
         timescale:  'daily', 'weekly', or 'monthly' (default 'weekly').
         data_type:  'work', 'cost', 'actual_work', 'actual_cost',
                     'remaining_work', 'baseline_work', 'baseline_cost' (default 'work').
@@ -4267,7 +4546,7 @@ def get_timephased_data(
     sd = _parse_date(start_date)
     ed = _parse_date(end_date)
     if sd is None or ed is None:
-        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD)."})
+        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD or DD/MM/YYYY)."})
 
     periods = []
     try:
@@ -4378,8 +4657,8 @@ def get_resource_availability(
 
     Args:
         resource_name: Name of the resource.
-        start_date:    Period start as YYYY-MM-DD.
-        end_date:      Period end as YYYY-MM-DD.
+        start_date:    Period start as YYYY-MM-DD or DD/MM/YYYY.
+        end_date:      Period end as YYYY-MM-DD or DD/MM/YYYY.
         timescale:     'daily', 'weekly', or 'monthly' (default 'weekly').
     """
     app  = get_app()
@@ -4587,8 +4866,8 @@ def add_recurring_task(
     Args:
         name:            Task name.
         recurrence_type: 'daily', 'weekly', or 'monthly' (default 'weekly').
-        start_date:      Recurrence range start (YYYY-MM-DD).
-        end_date:        Recurrence range end (YYYY-MM-DD).
+        start_date:      Recurrence range start (YYYY-MM-DD or DD/MM/YYYY).
+        end_date:        Recurrence range end (YYYY-MM-DD or DD/MM/YYYY).
         duration_days:   Duration of each occurrence in days (default 1).
         day_of_week:     For weekly: 1=Sun, 2=Mon, ..., 7=Sat (default 2=Monday).
     """
@@ -4599,7 +4878,7 @@ def add_recurring_task(
     sd = _parse_date(start_date)
     ed = _parse_date(end_date)
     if sd is None or ed is None:
-        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD)."})
+        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD or DD/MM/YYYY)."})
 
     dur = int(duration_days * mpd)
 
@@ -4723,7 +5002,7 @@ def set_resource_rate_table(
         standard_rate:  Standard rate as string, e.g. '50/h' or '400/d'.
         overtime_rate:  Overtime rate as string, e.g. '75/h'.
         cost_per_use:   Per-use cost (default -1 = don't change).
-        effective_date: When this rate takes effect (YYYY-MM-DD). Empty = first entry.
+        effective_date: When this rate takes effect (YYYY-MM-DD or DD/MM/YYYY). Empty = first entry.
     """
     app  = get_app()
     proj = get_proj(app)
@@ -4810,8 +5089,6 @@ def get_critical_path_sequence() -> str:
     forward = {uid: [] for uid in critical_tasks}
     incoming = {uid: 0 for uid in critical_tasks}
 
-    LINK_NAMES = {0: "FF", 1: "FS", 2: "SF", 3: "SS"}
-
     for uid, t in critical_tasks.items():
         try:
             for dep in t.TaskDependencies:
@@ -4819,7 +5096,7 @@ def get_critical_path_sequence() -> str:
                     succ_uid = dep.To.UniqueID
                     if succ_uid in critical_tasks:
                         lag = round(dep.Lag / mpd, 2) if dep.Lag else 0
-                        link = LINK_NAMES.get(dep.Type, "FS")
+                        link = _link_code(dep.Type)
                         forward[uid].append((succ_uid, link, lag))
                         incoming[succ_uid] = incoming.get(succ_uid, 0) + 1
         except Exception:
@@ -4923,8 +5200,8 @@ def get_critical_tasks_for_period(
     Perfect for period-focused reporting: 'What's critical in Q2?'
 
     Args:
-        start_date:  Period start (YYYY-MM-DD, required).
-        end_date:    Period end (YYYY-MM-DD, required).
+        start_date:  Period start (YYYY-MM-DD or DD/MM/YYYY, required).
+        end_date:    Period end (YYYY-MM-DD or DD/MM/YYYY, required).
         include_milestones: Include critical milestones in results (default True).
         include_non_critical_milestones: Also include non-critical milestones in the period (default False).
     """
@@ -4935,7 +5212,7 @@ def get_critical_tasks_for_period(
     period_start = _parse_date(start_date)
     period_end   = _parse_date(end_date)
     if not period_start or not period_end:
-        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD)."})
+        return json.dumps({"error": "Both start_date and end_date are required (YYYY-MM-DD or DD/MM/YYYY)."})
 
     critical_tasks = []
     critical_milestones = []
